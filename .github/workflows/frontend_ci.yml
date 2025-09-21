@@ -9,14 +9,14 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # required for azure/login@v2
+  id-token: write   # required for azure/login@v2 (OIDC)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # e.g. harryweek09acr.azurecr.io  (set this as a repo Secret)
+  # e.g. myacr.azurecr.io  (set this as repo Secret: AZURE_CONTAINER_REGISTRY)
   ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
   IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
 
@@ -54,6 +54,20 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      # ===== PR-ONLY OIDC VERIFICATION (safe: runs on PRs, does NOT push images) =====
+      - name: Azure login (OIDC) — verify (PR only)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+
+      - name: Verify OIDC login (who am I) — PR only
+        if: ${{ github.event_name == 'pull_request' }}
+        run: az account show --query "{subscriptionName:name, subscriptionId:id}" -o table
+      # ===== END PR-ONLY OIDC VERIFICATION =====
 
       - name: Install deps (ci if lockfile, else install)
         if: ${{ steps.locate.outputs.has_frontend == 'true' }}
@@ -119,7 +133,7 @@ jobs:
         if: ${{ steps.locate.outputs.has_frontend != 'true' }}
         run: echo "No frontend detected. Nothing to build/push."
 
-      # Login & push only when a frontend exists
+      # Login & push only when a frontend exists (on push events)
       - name: Azure login (OIDC)
         if: ${{ steps.locate.outputs.has_frontend == 'true' }}
         uses: azure/login@v2
