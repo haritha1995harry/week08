@@ -1,29 +1,38 @@
-# week08/.github/workflows/frontend_ci.yml
-name: Frontend CI — Test, Build & Push (frontend)
+name: Frontend CI — Test, Build & Push (auto-detect dir)
 
 on:
   pull_request:
     branches: [dev, main]
     paths:
       - 'frontend/**'
+      - 'client/**'
+      - 'web/**'
+      - 'ui/**'
+      - 'app/**'
+      - '**/package.json'
       - '.github/workflows/frontend_ci.yml'
   push:
     branches: [dev, main]
     paths:
       - 'frontend/**'
+      - 'client/**'
+      - 'web/**'
+      - 'ui/**'
+      - 'app/**'
+      - '**/package.json'
       - '.github/workflows/frontend_ci.yml'
   workflow_dispatch: {}
 
 permissions:
   contents: read
-  id-token: write   # required for Azure OIDC (azure/login@v2)
+  id-token: write   # needed for Azure OIDC (azure/login@v2)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # e.g. harryweek09acr.azurecr.io  (set as repo Secret AZURE_CONTAINER_REGISTRY)
+  # e.g. harryweek09acr.azurecr.io  (set this as a repo Secret)
   ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
   IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
 
@@ -31,9 +40,6 @@ jobs:
   build_frontend:
     name: Install, (lint/test if present), build
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
 
     steps:
       - name: Checkout
@@ -41,25 +47,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Use cache ONLY if a lockfile exists
-      - name: Setup Node (with cache if lockfile)
-        if: ${{ hashFiles('frontend/package-lock.json', 'frontend/npm-shrinkwrap.json', 'frontend/yarn.lock') != '' }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: |
-            frontend/package-lock.json
-            frontend/npm-shrinkwrap.json
-            frontend/yarn.lock
+      - name: Locate frontend directory (package.json)
+        id: locate
+        shell: bash
+        run: |
+          for d in frontend client web ui app .; do
+            if [ -f "$d/package.json" ]; then
+              echo "Found package.json in: $d"
+              echo "dir=$d" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "No package.json found in expected dirs." >&2
+          echo "Checked: frontend, client, web, ui, app, ."
+          exit 1
 
-      - name: Setup Node (no cache)
-        if: ${{ hashFiles('frontend/package-lock.json', 'frontend/npm-shrinkwrap.json', 'frontend/yarn.lock') == '' }}
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install deps (ci if lockfile, else install)
+        working-directory: ${{ steps.locate.outputs.dir }}
         shell: bash
         run: |
           if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
@@ -69,12 +78,15 @@ jobs:
           fi
 
       - name: Lint (if present)
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: npm run lint --if-present
 
       - name: Test (if present)
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: npm run test --if-present
 
       - name: Build (if present)
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: npm run build --if-present
 
   build_and_push_image:
@@ -86,6 +98,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Locate frontend directory (package.json)
+        id: locate
+        shell: bash
+        run: |
+          for d in frontend client web ui app .; do
+            if [ -f "$d/package.json" ]; then
+              echo "dir=$d" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "No package.json found in expected dirs." >&2
+          exit 1
 
       # ===== Option A: OIDC (recommended) =====
       - name: Azure login (OIDC)
@@ -102,27 +127,3 @@ jobs:
       #     creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Derive ACR_NAME from ACR_LOGIN_SERVER
-        id: derive
-        shell: bash
-        run: |
-          if [[ -z "${ACR_LOGIN_SERVER}" ]]; then
-            echo "ACR_LOGIN_SERVER secret is empty"; exit 1
-          fi
-          # harryweek09acr.azurecr.io -> harryweek09acr
-          ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
-          echo "ACR_NAME=$ACR_NAME" >> "$GITHUB_OUTPUT"
-
-      - name: Login to ACR
-        run: az acr login --name ${{ steps.derive.outputs.ACR_NAME }}
-
-      - name: Build & push frontend image
-        run: |
-          docker build -t ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }} ./frontend/
-          docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}
-          # optional convenience tag
-          docker tag  ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }} ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
-          docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
-
-      - name: Logout Azure
-        if: always()
-        run: az logout
