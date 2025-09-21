@@ -16,14 +16,14 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # needed for Azure OIDC (azure/login@v2)
+  id-token: write   # required for Azure OIDC (azure/login@v2)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # e.g. harryweek09acr.azurecr.io  (set this as a repo Secret)
+  # e.g. harryweek09acr.azurecr.io  (set as repo Secret AZURE_CONTAINER_REGISTRY)
   ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
   IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
 
@@ -41,16 +41,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Node
+      # Use cache ONLY if a lockfile exists
+      - name: Setup Node (with cache if lockfile)
+        if: ${{ hashFiles('frontend/package-lock.json', 'frontend/npm-shrinkwrap.json', 'frontend/yarn.lock') != '' }}
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm         # don't set cache-dependency-path (avoids missing file error)
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            frontend/npm-shrinkwrap.json
+            frontend/yarn.lock
+
+      - name: Setup Node (no cache)
+        if: ${{ hashFiles('frontend/package-lock.json', 'frontend/npm-shrinkwrap.json', 'frontend/yarn.lock') == '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
       - name: Install deps (ci if lockfile, else install)
         shell: bash
         run: |
-          if [ -f package-lock.json ]; then
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
             npm ci
           else
             npm install
@@ -84,8 +96,6 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
 
       # ----- Option B (fallback): Service Principal secret -----
-      # If you haven't set up OIDC yet, temporarily comment the OIDC step above
-      # and uncomment the block below:
       # - name: Azure login (SP secret)
       #   uses: azure/login@v1
       #   with:
