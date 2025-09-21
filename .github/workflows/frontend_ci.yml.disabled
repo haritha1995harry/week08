@@ -1,0 +1,170 @@
+name: Frontend CI — Test, Build & Push (auto-detect dir)
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required for azure/login@v2 (OIDC)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # e.g. myacr.azurecr.io  (set this as repo Secret: AZURE_CONTAINER_REGISTRY)
+  ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+  IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
+
+jobs:
+  build_frontend:
+    name: Install, (lint/test if present), build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate frontend directory
+        id: locate
+        run: |
+          set -e
+          DIR=""
+          for d in frontend client web ui app .; do
+            if [ -f "$d/package.json" ]; then
+              DIR="$d"
+              break
+            fi
+          done
+          if [ -n "$DIR" ]; then
+            echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+            echo "has_frontend=true" >> "$GITHUB_OUTPUT"
+            echo "Found frontend at: $DIR"
+          else
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            echo "has_frontend=false" >> "$GITHUB_OUTPUT"
+            echo "No frontend package.json found — skipping install/build steps"
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # ===== PR-ONLY OIDC VERIFICATION (safe: runs on PRs, does NOT push images) =====
+      - name: Azure login (OIDC) — verify (PR only)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+
+      - name: Verify OIDC login (who am I) — PR only
+        if: ${{ github.event_name == 'pull_request' }}
+        run: az account show --query "{subscriptionName:name, subscriptionId:id}" -o table
+      # ===== END PR-ONLY OIDC VERIFICATION =====
+
+      - name: Install deps (ci if lockfile, else install)
+        if: ${{ steps.locate.outputs.has_frontend == 'true' }}
+        run: |
+          cd "${{ steps.locate.outputs.dir }}"
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Lint (if present)
+        if: ${{ steps.locate.outputs.has_frontend == 'true' }}
+        run: |
+          cd "${{ steps.locate.outputs.dir }}"
+          npm run lint --if-present
+
+      - name: Test (if present)
+        if: ${{ steps.locate.outputs.has_frontend == 'true' }}
+        run: |
+          cd "${{ steps.locate.outputs.dir }}"
+          npm run test --if-present
+
+      - name: Build (if present)
+        if: ${{ steps.locate.outputs.has_frontend == 'true' }}
+        run: |
+          cd "${{ steps.locate.outputs.dir }}"
+          npm run build --if-present
+
+  build_and_push_image:
+    name: Build & Push Docker image (only on push)
+    runs-on: ubuntu-latest
+    needs: build_frontend
+    if: ${{ github.event_name == 'push' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate frontend directory
+        id: locate
+        run: |
+          set -e
+          DIR=""
+          for d in frontend client web ui app .; do
+            if [ -f "$d/package.json" ]; then
+              DIR="$d"
+              break
+            fi
+          done
+          if [ -n "$DIR" ]; then
+            echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+            echo "has_frontend=true" >> "$GITHUB_OUTPUT"
+            echo "Found frontend at: $DIR"
+          else
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            echo "has_frontend=false" >> "$GITHUB_OUTPUT"
+            echo "No frontend package.json found — skipping image build"
+          fi
+
+      # Stop early if there is no frontend
+      - name: Skip if no frontend
+        if: ${{ steps.locate.outputs.has_frontend != 'true' }}
+        run: echo "No frontend detected. Nothing to build/push."
+
+      # Login & push only when a frontend exists (on push events)
+      - name: Azure login (OIDC)
+        if: ${{ steps.locate.outputs.has_frontend == 'true' }}
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+
+      - name: Derive ACR_NAME
+        if: ${{ steps.locate.outputs.has_frontend == 'true' }}
+        id: derive
+        run: |
+          if [ -z "${ACR_LOGIN_SERVER}" ]; then
+            echo "ACR_LOGIN_SERVER secret is empty"; exit 1
+          fi
+          ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+          echo "ACR_NAME=$ACR_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ACR
+        if: ${{ steps.locate.outputs.has_frontend == 'true' }}
+        run: az acr login --name "${{ steps.derive.outputs.ACR_NAME }}"
+
+      - name: Build & push frontend image
+        if: ${{ steps.locate.outputs.has_frontend == 'true' }}
+        run: |
+          DIR="${{ steps.locate.outputs.dir }}"
+          docker build -t "${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}" "$DIR"
+          docker push "${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}"
+          docker tag "${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}" "${{ env.ACR_LOGIN_SERVER }}/frontend:latest"
+          docker push "${{ env.ACR_LOGIN_SERVER }}/frontend:latest"
+
+      - name: Logout Azure
+        if: always()
+        run: az logout
